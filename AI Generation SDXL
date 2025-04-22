@@ -1,0 +1,135 @@
+!pip install -q diffusers gradio transformers accelerate safetensors deep-translator langdetect
+
+import torch
+from diffusers import DiffusionPipeline
+import gradio as gr
+from deep_translator import GoogleTranslator
+from langdetect import detect
+import base64
+from io import BytesIO
+from PIL import Image
+
+# === Устройство и тип данных ===
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
+
+# === Загрузка SDXL ===
+pipe = DiffusionPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    torch_dtype=dtype,
+    use_safetensors=True,
+    variant="fp16" if dtype == torch.float16 else None
+)
+pipe.to(device)
+
+# === Соотношения сторон ===
+ASPECT_RATIOS = {
+    "1:1 (1024x1024)": (1024, 1024),
+    "4:3 (1024x768)": (1024, 768),
+    "16:9 (1152x648)": (1152, 648)
+}
+
+# === Переводчик (если не EN) ===
+def translate_if_needed(text):
+    try:
+        lang = detect(text)
+        if lang != "en":
+            return GoogleTranslator(source='auto', target='en').translate(text)
+    except Exception as e:
+        print("Ошибка перевода:", e)
+    return text
+
+# === Генерация изображений ===
+def generate(prompt, style, count, aspect_ratio, history_state, progress=gr.Progress(track_tqdm=True)):
+    count = int(count)
+    translated_prompt = translate_if_needed(prompt)
+
+    if style == "Выберите стиль изображения":
+        style = ""
+    full_prompt = f"{translated_prompt}, {style}" if style else translated_prompt
+    width, height = ASPECT_RATIOS.get(aspect_ratio, (1024, 1024))
+
+    result = []
+    for i in range(count):
+        progress(i, desc=f"Генерация {i+1}/{count}...")
+        image = pipe(prompt=full_prompt, width=width, height=height).images[0]
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        result.append((image, img_str))
+
+    history_state.append((prompt, result))
+    return [r[0] for r in result], history_state
+
+# === HTML история (с base64 ссылками + открытие в новой вкладке) ===
+def history_to_html(history_items):
+    html = ""
+    for prompt_text, images in reversed(history_items[-5:]):
+        html += f"<div style='margin-top:20px'><b style='color: #7c3aed;'>Промпт:</b> {prompt_text}<br><div style='display:flex;gap:10px;flex-wrap: wrap;'>"
+
+        for _, b64 in images:
+            img_data_url = f"data:image/png;base64,{b64}"
+            html += f"""
+            <a href="{img_data_url}" target="_blank">
+                <img src="{img_data_url}" width="128" style="border-radius:8px;cursor:pointer;">
+            </a>
+            """
+        html += "</div></div>"
+    return html
+
+# === Интерфейс ===
+with gr.Blocks(
+    theme=gr.themes.Soft(),
+    css="""
+    #gallery {
+        height: 600px !important;
+    }
+    #gallery .gallery {
+        grid-template-columns: repeat(auto-fill, minmax(256px, 1fr));
+        gap: 12px;
+        height: 100% !important;
+        align-content: start;
+    }
+    #gallery img {
+        border-radius: 8px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.2);
+    }
+"""
+) as demo:
+
+    gr.Markdown("## 🎨 MJalt теперь онлайн", elem_id="title")
+    gr.Markdown("*Создавайте изображения по описанию*", elem_id="subtitle")
+
+    history = gr.State(value=[])
+
+    with gr.Row():
+        with gr.Column(scale=2):
+            prompt = gr.Textbox(label="Описание (промпт)", placeholder="Futuristic city on sunset", lines=2)
+            style = gr.Dropdown(
+                choices=["Выберите стиль изображения", "фотореализм", "аниме", "киберпанк", "масляная живопись"],
+                value="Выберите стиль изображения",
+                label="Стиль изображения"
+            )
+            aspect_ratio = gr.Dropdown(
+                choices=list(ASPECT_RATIOS.keys()),
+                value="1:1 (1024x1024)",
+                label="Соотношение сторон"
+            )
+            count = gr.Dropdown(choices=["1", "2", "3", "4", "5"], value="1", label="Количество изображений")
+            btn = gr.Button("🎬 Сгенерировать")
+
+        with gr.Column(scale=3):
+            output = gr.Gallery(label="Результат", elem_id="gallery")
+            history_html = gr.HTML(label="История")
+
+    btn.click(
+        fn=generate,
+        inputs=[prompt, style, count, aspect_ratio, history],
+        outputs=[output, history]
+    ).then(
+        fn=history_to_html,
+        inputs=history,
+        outputs=history_html
+    )
+
+demo.launch(share=True, show_api=False)
